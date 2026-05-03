@@ -1,0 +1,25 @@
+[Unit]
+Description=Sync Snom config from private GitHub repository
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/snom-config-server
+ExecStart=/opt/snom-config-server/ops/sync-config.sh
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+ReadWritePaths=/opt/snom-config-server/data/config /var/lib/snom-config-server /var/lock
+
+[Install]
+WantedBy=multi-user.target

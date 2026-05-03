@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<functionKeys e="2">
+  <fkey idx="0" context="active" label="Zentrale" lp="on" default_text="$name" perm="R">dest &lt;sip:20@example.local;user&gt;</fkey>
+</functionKeys>

@@ -1,0 +1,8 @@
+[nginx-snom-config-auth]
+enabled = true
+port = 8080
+filter = nginx-snom-config-auth
+logpath = /var/log/nginx/access.log
+maxretry = 6
+findtime = 10m
+bantime = 1h
