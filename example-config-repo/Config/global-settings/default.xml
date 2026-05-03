@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phone-settings e="2">
+  <language perm="R">Deutsch</language>
+  <http_user perm="R">root</http_user>
+  <http_pass perm="R">changeme</http_pass>
+  <firmware_status perm="R">http://provisioning.example.local:8080/snomD385.php?version=10.1.215.13</firmware_status>
+</phone-settings>
