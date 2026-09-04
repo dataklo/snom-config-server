@@ -6,6 +6,7 @@ ENV_FILE="${SNOM_SYNC_ENV:-/etc/snom-config/sync.env}"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 : "${REPO_SSH_URL:?}" "${BRANCH:?}" "${TARGET_DIR:?}" "${KEY_PATH:?}" "${KNOWN_HOSTS:?}"
+: "${SSH_HOSTNAME:=ssh.github.com}" "${SSH_PORT:=443}"
 
 STATE_DIR=/var/lib/snom-config-server
 TMP_DIR="$(mktemp -d /tmp/snom-config-sync.XXXXXX)"
@@ -14,7 +15,7 @@ install -d -m 0750 "$TARGET_DIR" "$STATE_DIR"
 exec 9>/var/lock/snom-config-sync.lock
 flock -n 9 || { echo "Sync läuft bereits – übersprungen."; exit 0; }
 
-export GIT_SSH_COMMAND="ssh -i $KEY_PATH -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes"
+export GIT_SSH_COMMAND="ssh -i $KEY_PATH -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o Hostname=$SSH_HOSTNAME -p $SSH_PORT"
 remote_head="$(git ls-remote --heads "$REPO_SSH_URL" "$BRANCH" | awk 'NR==1 {print $1}')"
 [[ -n "$remote_head" ]] || { echo "Remote-Commit nicht gefunden." >&2; exit 1; }
 last_file="$STATE_DIR/last_synced_commit"

@@ -13,6 +13,23 @@ die() { printf 'FEHLER: %s\n' "$*" >&2; exit 1; }
 prompt() { local __name="$1" __text="$2" __default="$3" __value; read -r -p "$__text [$__default]: " __value; printf -v "$__name" '%s' "${__value:-$__default}"; }
 secret() { local __name="$1" __text="$2" __value; read -r -s -p "$__text: " __value; echo; [[ -n "$__value" ]] || die "$__text darf nicht leer sein."; printf -v "$__name" '%s' "$__value"; }
 valid_path() { [[ "$1" = /* && "$1" != "/" && "$1" != *$'\n'* ]] || die "Ungültiger absoluter Pfad: $1"; }
+secure_app_path() {
+  local path="$1" require_complete="${2:-no}" owner mode
+
+  while :; do
+    if [[ -e "$path" ]]; then
+      [[ -d "$path" && ! -L "$path" ]] || die "APP_DIR-Pfadkomponente ist kein echtes Verzeichnis: $path"
+      owner="$(stat -c '%u' -- "$path")"
+      mode="$(stat -c '%a' -- "$path")"
+      [[ "$owner" -eq 0 ]] || die "APP_DIR muss vollständig unter root-eigenen Verzeichnissen liegen: $path"
+      (( (8#$mode & 0022) == 0 )) || die "APP_DIR-Pfadkomponente darf nicht für Gruppe/Andere schreibbar sein: $path"
+    elif [[ "$require_complete" == yes ]]; then
+      die "APP_DIR-Pfadkomponente fehlt nach der Installation: $path"
+    fi
+    [[ "$path" == / ]] && break
+    path="$(dirname -- "$path")"
+  done
+}
 
 [[ "$EUID" -eq 0 ]] || die "Bitte als root ausführen."
 
@@ -32,6 +49,13 @@ prompt PHONE_HTTP_USER "Telefon-HTTP Benutzername für die XML" "root"
 secret PHONE_HTTP_PASS "Telefon-HTTP Passwort für die XML"
 
 valid_path "$APP_DIR"; valid_path "$SITE_ROOT"
+# Nginx erhält unten den normalisierten Pfad. Dadurch können Symlink-Komponenten
+# nicht später auf ein anderes Ziel zeigen. Alle bereits vorhandenen Komponenten
+# müssen root gehören und dürfen nicht von weniger privilegierten Benutzern
+# ersetzt werden können.
+APP_DIR="$(realpath -m -- "$APP_DIR")"
+SITE_ROOT="$(realpath -m -- "$SITE_ROOT")"
+secure_app_path "$APP_DIR"
 [[ "$SYNC_INTERVAL_MIN" =~ ^[1-9][0-9]*$ ]] || die "Das Sync-Intervall muss eine positive Ganzzahl sein."
 [[ "$TRANSFER_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Ungültiger Benutzername."
 [[ "$FTP_PUBLIC_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "Ungültige öffentliche FTPS-Adresse."
@@ -59,6 +83,12 @@ if [[ "$SOURCE_DIR" != "$APP_DIR" ]]; then
 else
   install -d -m 0755 "$APP_DIR/public" "$APP_DIR/ops"
 fi
+# Auch ein bereits vorhandenes APP_DIR wird nicht stillschweigend mit seinen
+# bisherigen Rechten weiterverwendet. Die zweite Prüfung erfasst außerdem alle
+# von install(1) neu angelegten Zwischenverzeichnisse.
+chown root:root "$APP_DIR"
+chmod 0755 "$APP_DIR"
+secure_app_path "$APP_DIR" yes
 # PHP wird direkt aus dem root-eigenen APP_DIR ausgeliefert. Transfer-Zugangsdaten
 # können daher niemals zum Ersetzen oder Hochladen ausführbarer Endpunkte dienen.
 chown -R root:root "$APP_DIR/public"
@@ -83,9 +113,22 @@ echo "======================================================================"
 echo
 read -r -p "Wenn der Public Key bei GitHub hinterlegt ist, Enter drücken: " _
 
-ssh-keyscan -H github.com > /etc/snom-config/known_hosts 2>/dev/null || die "GitHub Host-Key konnte nicht geladen werden (DNS/Netz prüfen)."
+# Viele Hoster und Firewalls sperren ausgehendes SSH auf Port 22. GitHub stellt
+# dafür offiziell ssh.github.com auf Port 443 bereit. Der ursprüngliche Repo-URL
+# bleibt unverändert; Hostname/Port werden ausschließlich im SSH-Aufruf ersetzt.
+echo "Lade GitHub SSH-Host-Key über ssh.github.com:443 ..."
+KNOWN_HOSTS_TMP="$(mktemp)"
+trap 'rm -f "$KNOWN_HOSTS_TMP"' EXIT
+if ! ssh-keyscan -T 10 -p 443 -H ssh.github.com > "$KNOWN_HOSTS_TMP" 2>/dev/null || [[ ! -s "$KNOWN_HOSTS_TMP" ]]; then
+  die "GitHub Host-Key konnte über Port 443 nicht geladen werden (DNS/HTTPS-Firewall prüfen)."
+fi
+install -o root -g root -m 0644 "$KNOWN_HOSTS_TMP" /etc/snom-config/known_hosts
+rm -f "$KNOWN_HOSTS_TMP"
+trap - EXIT
 chmod 0644 /etc/snom-config/known_hosts
-SSH_COMMAND="ssh -i $KEY_PATH -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/snom-config/known_hosts -o StrictHostKeyChecking=yes"
+SSH_HOSTNAME=ssh.github.com
+SSH_PORT=443
+SSH_COMMAND="ssh -i $KEY_PATH -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/snom-config/known_hosts -o StrictHostKeyChecking=yes -o Hostname=$SSH_HOSTNAME -p $SSH_PORT"
 until GIT_SSH_COMMAND="$SSH_COMMAND" git ls-remote --exit-code --heads "$REPO_SSH_URL" "$BRANCH" >/dev/null 2>&1; do
   read -r -p "Repo noch nicht erreichbar. Deploy Key hinterlegt? Mit Enter erneut prüfen (q = Abbruch): " retry
   [[ "$retry" != q ]] || die "Installation abgebrochen."
@@ -97,6 +140,8 @@ done
   printf 'TARGET_DIR=%q\n' "$SITE_ROOT/private/config"
   printf 'KEY_PATH=%q\n' "$KEY_PATH"
   printf 'KNOWN_HOSTS=%q\n' /etc/snom-config/known_hosts
+  printf 'SSH_HOSTNAME=%q\n' "$SSH_HOSTNAME"
+  printf 'SSH_PORT=%q\n' "$SSH_PORT"
   printf 'PHONE_SECRETS=%q\n' /etc/snom-config/phone.env
 } > /etc/snom-config/sync.env
 {
