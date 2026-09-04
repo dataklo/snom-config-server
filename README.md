@@ -1,178 +1,97 @@
-# Snom Config Server (hardened)
+# Snom Config Server für Ubuntu-/Proxmox-CT
 
-Dieses Repository enthält eine abgesicherte Referenz für einen Snom-Konfigurationsserver im Container auf Port `8080`.
+Dieses Repository installiert einen Snom-Provisioning-Server auf einem Ubuntu-Container. Die Domain zeigt ausschließlich auf den automatisch erzeugten Ordner `www`; die aus dem privaten Git-Repository geladenen XML-Dateien liegen daneben in `private/config` und können deshalb niemals als statische Dateien vom Webserver ausgeliefert werden.
 
-## Wichtiges Architektur-Prinzip
+## Architektur
 
-- Der **Container macht nur HTTP auf Port 8080**.
-- **Kein HTTPS und keine Proxy-Logik im Container**.
-- TLS/HTTPS und öffentliches Routing werden vollständig vom **externen Proxy** übernommen.
-- XML-Dateien liegen **nicht im Webverzeichnis**, sondern ausschließlich in `data/config/`.
+Bei den Standardwerten entsteht folgende Trennung:
 
-## Zielbild
+```text
+/srv/snom-config/                 # FTPS-/SFTP-Chroot, root-owned
+├── www/                          # einziger Webroot; PHP-Endpunkte
+└── private/config/               # sensible Repo-Daten; nicht öffentlich
+/opt/snom-config-server/          # Anwendung und Betriebs-Skripte
+/etc/snom-config/                 # Deploy Key und Secrets (0600)
+```
 
-- Ubuntu 25.04 LXC/Container unter Proxmox
-- lokaler Webserver nur auf `8080`
-- Zugriffsschutz via Benutzername/Passwort (HTTP Basic Auth)
-- Trennung von Code und Konfigurationsdaten
-- Konfigurationsdaten werden aus privatem GitHub-Repo (`Config/`) synchronisiert
+Nginx lauscht auf HTTP-Port `8080`; TLS und die öffentliche Domain können weiterhin am vorgeschalteten Proxy enden. Dateiübertragung ist per **explizitem FTPS auf Port 21** (passive Ports `40000–40100`) und **SFTP auf Port 22** möglich. Beide verwenden den beim Setup abgefragten Benutzer. Dessen SFTP-Sitzung ist auf den Site-Root beschränkt. Das Verzeichnis `private` ist nur für root und PHP lesbar.
 
-## Verzeichnisstruktur
+## Installation per Copy & Paste
 
-- `public/` – Webroot mit PHP-Endpunkten
-- `data/config/` – lokale Spiegelung von `Config/` aus privatem Repo (nicht öffentlich)
-- `ops/` – Nginx/PHP-FPM/Systemd-Beispiele
+Auf einem frischen Ubuntu-CT kann die komplette Installation mit diesem einen Befehl gestartet werden:
 
-## Schnellstart
+```bash
+curl -fsSL https://raw.githubusercontent.com/dataklo/snom-config-server/main/install-ubuntu-ct.sh \
+  -o /tmp/install-snom-config.sh \
+  && sudo bash /tmp/install-snom-config.sh
+```
 
-1. Pakete installieren:
-   - `sudo apt update`
-   - `sudo apt install -y nginx php-fpm php-cli php-xml apache2-utils git rsync`
-2. Diese Dateien nach `/opt/snom-config-server` kopieren.
-3. GitHub Deploy Key anlegen (nur Read-Only) und in `~/.ssh` hinterlegen.
-4. `ops/sync-config.sh` anpassen (Repo-URL + Branch + Zielpfad).
-5. Nginx-Config aus `ops/nginx-snom-config.conf` aktivieren.
-6. Passwortdatei erstellen:
-   - `sudo htpasswd -c /etc/nginx/.htpasswd-snom admin`
-7. Service neu laden:
-   - `sudo nginx -t && sudo systemctl reload nginx`
-8. Sync starten:
-   - `sudo bash ops/sync-config.sh`
+Das Bootstrap-Skript installiert zunächst Git und CA-Zertifikate, lädt dieses öffentliche Repository über HTTPS in ein temporäres Verzeichnis und startet anschließend den interaktiven Installer. Es benötigt für das Server-Repository keinen GitHub-Schlüssel. Optional können vor dem Start `SERVER_REPO_URL` und `SERVER_REPO_BRANCH` gesetzt werden.
 
-## Endpunkte
+Der Container erzeugt während der Installation selbst einen neuen Ed25519-Schlüssel. Nur der **öffentliche** Teil wird deutlich im Terminal ausgegeben. Nach dem Einfügen unter **GitHub → privates Config-Repository → Settings → Deploy keys → Add deploy key** wartet das Setup auf Enter und prüft den Zugriff. Die Option für Schreibzugriff darf nicht aktiviert werden.
 
-- `GET /fkey.php?file=default`
+## Installation aus einem vorhandenen Checkout
+
+Auf einem frischen Ubuntu-CT das Repository übertragen/klonen und ausführen:
+
+```bash
+cd snom-config-server
+sudo bash ops/install.sh
+```
+
+Der Installer fragt interaktiv ab:
+
+- Installations- und Site-Root-Pfad;
+- gemeinsamen FTPS-/SFTP-Benutzer und Passwort;
+- SSH-URL und Branch des privaten Config-Repositories;
+- Sync-Intervall;
+- Nginx-Bind-Adresse und HTTP-Basic-Auth-Zugang;
+- Zugangsdaten, die in `http_user`/`http_pass` der Telefon-XML eingesetzt werden.
+
+Falls noch nicht vorhanden, erzeugt er einen separaten Ed25519 Deploy Key. Er zeigt den öffentlichen Schlüssel an und wartet, bis dieser im privaten GitHub-Repository als **read-only Deploy Key** eingetragen wurde. Der private Schlüssel verlässt den Container nicht. Das Config-Repo muss enthalten:
+
+```text
+Config/fkey/*.xml
+Config/global-settings/*.xml
+Config/macs.json
+```
+
+Danach richtet das Skript Nginx, PHP-FPM, OpenSSH/SFTP, vsftpd/FTPS und den systemd-Sync-Timer ein. Es erkennt den installierten PHP-FPM-Socket dynamisch und funktioniert daher ohne fest codierte PHP-Version auf unterstützten Ubuntu-Versionen.
+
+> Die Domain bzw. der externe Proxy muss auf `<SITE_ROOT>/www` zeigen. Niemals den Site-Root selbst als Webroot konfigurieren.
+
+## Betrieb
+
+Standard-Endpunkte:
+
 - `GET /global-settings.php?file=default`
+- `GET /fkey.php?file=default`
 - `GET /snomD385.php?version=10.1.215.13`
 - `GET /snomD785.php?version=10.1.215.13`
 
-Alle Endpunkte liefern XML und erwarten HTTP Basic Auth auf Webserver-Ebene.
-
-
-## Automatisches Update alle 15 Minuten
-
-1. Unit-Dateien installieren:
-   - `sudo cp ops/snom-config-sync.service /etc/systemd/system/`
-   - `sudo cp ops/snom-config-sync.timer /etc/systemd/system/`
-2. Systemd neu laden und Timer aktivieren:
-   - `sudo systemctl daemon-reload`
-   - `sudo systemctl enable --now snom-config-sync.timer`
-3. Status prüfen:
-   - `systemctl status snom-config-sync.timer`
-   - `systemctl list-timers | grep snom-config-sync`
-
-Der Sync prüft zunächst den Remote-Commit und synchronisiert nur bei Änderungen. Dadurch ist die Last niedrig und unnötige Clones werden vermieden.
-
-
-## Interaktiver Installer
-
-Für eine komplette interaktive Einrichtung (inkl. SSH-Key-Erzeugung für GitHub Deploy Key, Repo-Konfiguration, Basic Auth und 15-Minuten-Timer):
+Alle Endpunkte sind durch den abgefragten HTTP-Basic-Auth-Zugang geschützt.
 
 ```bash
-sudo bash /opt/snom-config-server/ops/install.sh
-```
+# Sync sofort ausführen
+sudo systemctl start snom-config-sync.service
 
-Der Installer:
-- fragt Repo-URL, Branch, Zielpfad und Sync-Intervall ab,
-- erzeugt bei Bedarf einen neuen `ed25519` SSH-Key,
-- zeigt den Public Key direkt zur Hinterlegung in GitHub,
-- legt `sync-config.env` für deine Repo-Parameter an,
-- richtet Nginx, Basic Auth und den systemd-Timer automatisch ein.
+# Timer und letzten Lauf prüfen
+systemctl status snom-config-sync.timer
+journalctl -u snom-config-sync.service
 
-## Telefon-Provisioning (wichtig)
-
-Der Installer fragt explizit nach den Telefon-Zugangsdaten (`http_user` / `http_pass`) und schreibt diese nach dem ersten Sync in `global-settings/default.xml`.
-
-### URLs für Snom-Telefone
-
-In den Telefonen trägst du als Settings-URL (Provisioning URL) ein:
-
-- `http://<DEIN-HOST>:8080/global-settings.php?file=default`
-
-Falls du Funktionstasten getrennt laden möchtest, zusätzlich:
-
-- `http://<DEIN-HOST>:8080/fkey.php?file=default`
-
-Firmware-Status-URL (Beispiel für D385):
-
-- `http://<DEIN-HOST>:8080/snomD385.php?version=10.1.215.13`
-
-> Hinweis: Wenn ein externer Proxy davor hängt, kannst du `<DEIN-HOST>` durch deine externe URL ersetzen. Der Container selbst bleibt weiterhin HTTP/8080-only.
-
-
-### URL-Login für XML-Abruf
-
-Der Installer fragt zusätzlich den **URL-Login** (HTTP Basic Auth) ab. Das sind die Zugangsdaten, die beim Abruf der XML-Dateien am Server benötigt werden.
-
-Beispiel (nur zum Verständnis, nicht im Klartext speichern):
-
-- `http://<URL-LOGIN-USER>:<URL-LOGIN-PASS>@<DEIN-HOST>:8080/global-settings.php?file=default`
-
-Besser ist, im Telefon Benutzername/Passwort in den jeweiligen Feldern zu hinterlegen und die URL ohne Klartext-Passwort zu verwenden.
-
-
-## Beispielstruktur für das private Config-Repo
-
-Im Ordner `example-config-repo/` liegt eine lauffähige Beispielstruktur, wie dein privates GitHub-Config-Repo aufgebaut sein muss:
-
-- `Config/fkey/*.xml`
-- `Config/global-settings/*.xml`
-- `Config/macs.json`
-
-Du kannst diese Struktur 1:1 als Vorlage übernehmen.
-
-
-## Fail2ban (optional)
-
-Zum Schutz gegen Brute-Force auf den URL-Login sind Beispieldateien enthalten:
-
-- `ops/fail2ban/jail.d-snom-config.local`
-- `ops/fail2ban/filter.d-nginx-snom-config-auth.conf`
-
-Beispielinstallation:
-
-```bash
-sudo apt install -y fail2ban
-sudo cp ops/fail2ban/jail.d-snom-config.local /etc/fail2ban/jail.d/snom-config.local
-sudo cp ops/fail2ban/filter.d-nginx-snom-config-auth.conf /etc/fail2ban/filter.d/nginx-snom-config-auth.conf
-sudo systemctl restart fail2ban
-sudo fail2ban-client status nginx-snom-config-auth
-```
-
-
-## Security-Checkliste
-
-Wenn der Server private Daten ausliefert, solltest du mindestens Folgendes aktivieren:
-
-- Zugriff auf Port `8080` auf Proxy-IP/CIDR begrenzen (Installer-Feld `Erlaubtes Proxy-Netz`).
-- Fail2ban aktivieren (`ops/fail2ban/*`).
-- Nur starke Passwörter für URL-Login/Telefon-Zugang verwenden.
-- Security Updates automatisch einspielen.
-- Logs überwachen (`journalctl`, `fail2ban-client`).
-
-Details: siehe `SECURITY.md`.
-
-
-## Audit-Logging
-
-Jeder Request auf die XML/Firmware-Endpunkte wird zusätzlich in eine Audit-Datei geschrieben:
-
-- `/var/log/snom-config/audit.log`
-
-Pro Eintrag werden Zeitstempel, Client-IP, User, Endpoint, Statuscode und URI protokolliert.
-
-## Panikschalter / Maintenance Mode
-
-Wenn du den Server kurzfristig abschotten willst:
-
-```bash
+# Konfiguration sperren/entsperren
 sudo touch /etc/snom-config/maintenance.on
-```
-
-Dann erhalten alle Clients `503`, außer der konfigurierten Admin-IP.
-
-Deaktivieren:
-
-```bash
 sudo rm /etc/snom-config/maintenance.on
 ```
+
+Der Sync prüft zuerst den Remote-Commit, klont nur bei Änderungen in ein temporäres Verzeichnis, validiert die erwartete Struktur und veröffentlicht anschließend atomarm mit restriktiven Rechten. Telefon-Zugangsdaten werden bei **jedem** Sync in der temporären Kopie eingesetzt; sie müssen daher nicht im Git-Repository stehen und werden nicht beim nächsten Update überschrieben.
+
+## Netzwerk / Firewall
+
+Freizugeben sind nur die tatsächlich benötigten Ports:
+
+- `22/tcp` für SFTP/SSH;
+- `21/tcp` und `40000:40100/tcp` für explizites FTPS;
+- `8080/tcp` möglichst ausschließlich für den Reverse Proxy.
+
+Das automatisch vorhandene Snakeoil-Zertifikat ermöglicht die Erstinstallation von FTPS, sollte für den Produktivbetrieb aber in `/etc/vsftpd.conf` durch ein eigenes vertrauenswürdiges Zertifikat ersetzt werden. Weitere Härtungshinweise stehen in [SECURITY.md](SECURITY.md).

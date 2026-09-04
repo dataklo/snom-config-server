@@ -5,7 +5,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/bootstrap.php';
 snomMaintenanceGuard('fkey');
 
-$baseDir = dirname(__DIR__) . '/data/config/fkey/';
+$baseDir = rtrim(snomEnv('DATA_DIR', dirname(__DIR__) . '/data/config'), '/') . '/fkey/';
 $rawFile = isset($_GET['file']) ? (string) $_GET['file'] : 'default';
 $file = basename(trim($rawFile));
 
