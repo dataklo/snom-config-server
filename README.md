@@ -22,14 +22,46 @@ Nginx lauscht auf HTTP-Port `8080`; TLS und die öffentliche Domain können weit
 Auf einem frischen Ubuntu-CT kann die komplette Installation mit diesem einen Befehl gestartet werden:
 
 ```bash
+apt-get update && apt-get install -y curl && \
 curl -fsSL https://raw.githubusercontent.com/dataklo/snom-config-server/main/install-ubuntu-ct.sh \
   -o /tmp/install-snom-config.sh \
-  && sudo bash /tmp/install-snom-config.sh
+  && bash /tmp/install-snom-config.sh
 ```
 
-Das Bootstrap-Skript installiert zunächst Git und CA-Zertifikate, lädt dieses öffentliche Repository über HTTPS in ein temporäres Verzeichnis und startet anschließend den interaktiven Installer. Es benötigt für das Server-Repository keinen GitHub-Schlüssel. Optional können vor dem Start `SERVER_REPO_URL` und `SERVER_REPO_BRANCH` gesetzt werden.
+Der erste Teil installiert auch auf einem Minimal-Container das für den Download benötigte `curl`. Das Bootstrap-Skript installiert anschließend Git und CA-Zertifikate, lädt dieses öffentliche Repository über HTTPS in ein temporäres Verzeichnis und startet den interaktiven Installer. Es benötigt für das Server-Repository keinen GitHub-Schlüssel. Optional können vor dem Start `SERVER_REPO_URL` und `SERVER_REPO_BRANCH` gesetzt werden.
 
 Der Container erzeugt während der Installation selbst einen neuen Ed25519-Schlüssel. Nur der **öffentliche** Teil wird deutlich im Terminal ausgegeben. Nach dem Einfügen unter **GitHub → privates Config-Repository → Settings → Deploy keys → Add deploy key** wartet das Setup auf Enter und prüft den Zugriff. Die Option für Schreibzugriff darf nicht aktiviert werden.
+
+Der Zugriff auf das private GitHub-Repository erfolgt über `ssh.github.com:443`, weil ausgehender SSH-Verkehr auf Port 22 bei vielen Hostern gesperrt ist. Bricht die interaktive Installation ab, wird der temporäre Checkout absichtlich gelöscht. Nach Beheben der Ursache daher einfach den vollständigen Bootstrap-Befehl erneut ausführen; ein Verzeichnis `~/snom-config-server` wird dabei nicht angelegt.
+
+### Abgebrochene Installation erneut starten
+
+Der Bootstrap klont das Server-Repository nur vorübergehend nach `/tmp` und räumt es beim Beenden wieder auf. Deshalb funktionieren nach einem Abbruch weder `cd snom-config-server` noch `bash ops/install.sh`, sofern das Repository nicht separat geklont wurde. Auch die systemd-Units werden erst gegen Ende einer erfolgreichen Installation angelegt.
+
+Zum Fortsetzen den Bootstrap vollständig erneut starten:
+
+```bash
+apt-get update && apt-get install -y curl && \
+curl -fsSL https://raw.githubusercontent.com/dataklo/snom-config-server/main/install-ubuntu-ct.sh \
+  -o /tmp/install-snom-config.sh \
+  && bash /tmp/install-snom-config.sh
+```
+
+Bereits installierte Pakete und der unter `/etc/snom-config/config_repo_ed25519` erzeugte Deploy Key werden dabei wiederverwendet. Der zuvor bei GitHub hinterlegte öffentliche Schlüssel bleibt daher gültig. Alle als Passwort abgefragten Werte müssen erneut eingegeben werden und dürfen nicht leer sein. Nach der Ausgabe des Public Keys zuerst kontrollieren, dass genau dieser Schlüssel im privaten Config-Repository als read-only Deploy Key hinterlegt ist, und erst dann Enter drücken.
+
+Falls der Zugriff auf das private Repository weiterhin nicht klappt, die Verbindung unabhängig vom Installer prüfen:
+
+```bash
+ssh -T -p 443 \
+  -i /etc/snom-config/config_repo_ed25519 \
+  -o IdentitiesOnly=yes \
+  -o Hostname=ssh.github.com \
+  -o UserKnownHostsFile=/etc/snom-config/known_hosts \
+  -o StrictHostKeyChecking=yes \
+  git@github.com
+```
+
+Die GitHub-Meldung, dass keine Shell bereitgestellt wird, ist bei erfolgreicher Authentifizierung normal. Erst nachdem der Installer vollständig durchgelaufen ist, sind `snom-config-sync.service` und `snom-config-sync.timer` verfügbar.
 
 ## Installation aus einem vorhandenen Checkout
 
