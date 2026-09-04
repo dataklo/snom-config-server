@@ -1,211 +1,180 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="/opt/snom-config-server"
-SSH_DIR="/root/.ssh"
-KEY_PATH="$SSH_DIR/snom_config_repo_ed25519"
-KNOWN_HOSTS="$SSH_DIR/known_hosts"
-SERVICE_SRC="$APP_DIR/ops/snom-config-sync.service"
-TIMER_SRC="$APP_DIR/ops/snom-config-sync.timer"
-SERVICE_DST="/etc/systemd/system/snom-config-sync.service"
-TIMER_DST="/etc/systemd/system/snom-config-sync.timer"
+SITE_ROOT="/srv/snom-config"
+TRANSFER_USER="snomupload"
+REPO_SSH_URL="git@github.com:dataklo/lbs-snom-config.git"
+BRANCH="main"
+SYNC_INTERVAL_MIN="15"
 
-if [[ "${EUID}" -ne 0 ]]; then
-  echo "Bitte als root ausführen."
-  exit 1
+die() { printf 'FEHLER: %s\n' "$*" >&2; exit 1; }
+prompt() { local __name="$1" __text="$2" __default="$3" __value; read -r -p "$__text [$__default]: " __value; printf -v "$__name" '%s' "${__value:-$__default}"; }
+secret() { local __name="$1" __text="$2" __value; read -r -s -p "$__text: " __value; echo; [[ -n "$__value" ]] || die "$__text darf nicht leer sein."; printf -v "$__name" '%s' "$__value"; }
+valid_path() { [[ "$1" = /* && "$1" != "/" && "$1" != *$'\n'* ]] || die "Ungültiger absoluter Pfad: $1"; }
+
+[[ "$EUID" -eq 0 ]] || die "Bitte als root ausführen."
+
+echo "=== Snom Config Server – Ubuntu/Proxmox-CT Installer ==="
+prompt APP_DIR "Pfad für Programmdateien (nicht im Webroot)" "$APP_DIR"
+prompt SITE_ROOT "FTP/SFTP-Root (die Domain muss auf SITE_ROOT/www zeigen)" "$SITE_ROOT"
+prompt TRANSFER_USER "Benutzer für FTPS und SFTP" "$TRANSFER_USER"
+secret TRANSFER_PASS "Passwort für FTPS/SFTP-Benutzer"
+prompt REPO_SSH_URL "Privates Config-Repo (SSH URL)" "$REPO_SSH_URL"
+prompt BRANCH "Git Branch" "$BRANCH"
+prompt SYNC_INTERVAL_MIN "Sync-Intervall in Minuten" "$SYNC_INTERVAL_MIN"
+prompt BIND_ADDR "Nginx Bind-Adresse" "0.0.0.0"
+prompt BASIC_USER "URL-Login Benutzername" "admin"
+secret BASIC_PASS "URL-Login Passwort"
+prompt PHONE_HTTP_USER "Telefon-HTTP Benutzername für die XML" "root"
+secret PHONE_HTTP_PASS "Telefon-HTTP Passwort für die XML"
+
+valid_path "$APP_DIR"; valid_path "$SITE_ROOT"
+[[ "$SYNC_INTERVAL_MIN" =~ ^[1-9][0-9]*$ ]] || die "Das Sync-Intervall muss eine positive Ganzzahl sein."
+[[ "$TRANSFER_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Ungültiger Benutzername."
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y nginx php-fpm php-cli php-xml apache2-utils git rsync openssh-client openssh-server vsftpd ssl-cert python3 util-linux
+
+# Der Chroot selbst muss root gehören. Nur www ist für den Transfer-Benutzer schreibbar.
+install -d -o root -g root -m 0755 "$SITE_ROOT"
+install -d -o root -g www-data -m 0750 "$SITE_ROOT/private" "$SITE_ROOT/private/config"
+if ! id "$TRANSFER_USER" >/dev/null 2>&1; then
+  useradd --home-dir / --shell /usr/sbin/nologin --no-create-home "$TRANSFER_USER"
 fi
+printf '%s:%s\n' "$TRANSFER_USER" "$TRANSFER_PASS" | chpasswd
+install -d -o "$TRANSFER_USER" -g "$TRANSFER_USER" -m 0750 "$SITE_ROOT/www"
 
-read -r -p "Installationspfad [$APP_DIR]: " input_app_dir
-APP_DIR="${input_app_dir:-$APP_DIR}"
+# Installationsquellen kopieren; Repo-Geheimnisse und Config bleiben außerhalb von www.
+if [[ "$SOURCE_DIR" != "$APP_DIR" ]]; then
+  install -d -m 0755 "$APP_DIR"
+  rsync -a --delete --exclude data --exclude ops/sync-config.env "$SOURCE_DIR/public/" "$APP_DIR/public/"
+  rsync -a --delete "$SOURCE_DIR/ops/" "$APP_DIR/ops/"
+else
+  install -d -m 0755 "$APP_DIR/public" "$APP_DIR/ops"
+fi
+rsync -a --delete "$APP_DIR/public/" "$SITE_ROOT/www/"
+chown -R "$TRANSFER_USER:$TRANSFER_USER" "$SITE_ROOT/www"
+find "$SITE_ROOT/www" -type d -exec chmod 0755 {} +
+find "$SITE_ROOT/www" -type f -exec chmod 0644 {} +
 
-read -r -p "GitHub Repo SSH URL [git@github.com:dataklo/lbs-snom-config.git]: " input_repo
-REPO_SSH_URL="${input_repo:-git@github.com:dataklo/lbs-snom-config.git}"
+install -d -m 0750 /etc/snom-config /var/lib/snom-config-server /var/log/snom-config
+KEY_PATH=/etc/snom-config/config_repo_ed25519
+if [[ ! -f "$KEY_PATH" ]]; then ssh-keygen -q -t ed25519 -C "snom-config-deploy@$(hostname)" -f "$KEY_PATH" -N ''; fi
+chmod 0600 "$KEY_PATH"; chmod 0644 "$KEY_PATH.pub"
 
-read -r -p "Git Branch [main]: " input_branch
-BRANCH="${input_branch:-main}"
-
-read -r -p "Sync-Zielpfad [$APP_DIR/data/config]: " input_target
-TARGET_DIR="${input_target:-$APP_DIR/data/config}"
-
-read -r -p "Sync-Intervall in Minuten [15]: " input_interval
-SYNC_INTERVAL_MIN="${input_interval:-15}"
-
-read -r -p "Nginx bind Adresse [0.0.0.0]: " input_bind
-BIND_ADDR="${input_bind:-0.0.0.0}"
-
-read -r -p "Optional: Erlaubtes Proxy-Netz (CIDR, leer = alle) []: " input_proxy_cidr
-TRUSTED_PROXY_CIDR="${input_proxy_cidr:-}"
-
-read -r -p "Admin-IP für Maintenance-Bypass [127.0.0.1]: " input_admin_ip
-ADMIN_IP="${input_admin_ip:-127.0.0.1}"
-
-read -r -p "URL-Login Benutzername für XML-Download [admin]: " input_user
-BASIC_USER="${input_user:-admin}"
-
-read -r -s -p "URL-Login Passwort für XML-Download: " BASIC_PASS
 echo
-if [[ -z "$BASIC_PASS" ]]; then
-  echo "Passwort darf nicht leer sein."
-  exit 1
-fi
-
-
-read -r -p "Telefon-HTTP Benutzername (für XML, z.B. root) [root]: " input_phone_user
-PHONE_HTTP_USER="${input_phone_user:-root}"
-
-read -r -s -p "Telefon-HTTP Passwort (für XML): " PHONE_HTTP_PASS
+echo "======================================================================"
+echo "Diesen PUBLIC KEY jetzt im privaten Config-Repo als Read-only Deploy Key hinterlegen:"
+echo "GitHub: Repository > Settings > Deploy keys > Add deploy key"
+echo "----------------------------------------------------------------------"
+cat "$KEY_PATH.pub"
+echo "======================================================================"
 echo
-if [[ -z "$PHONE_HTTP_PASS" ]]; then
-  echo "Telefon-HTTP Passwort darf nicht leer sein."
-  exit 1
-fi
+read -r -p "Wenn der Public Key bei GitHub hinterlegt ist, Enter drücken: " _
 
-apt update
-apt install -y nginx php-fpm php-cli php-xml apache2-utils git rsync openssh-client
-
-install -d -m 0750 "$TARGET_DIR/fkey" "$TARGET_DIR/global-settings"
-install -d -m 0750 /etc/snom-config /var/log/snom-config
-install -d -m 0700 "$SSH_DIR"
-
-if [[ ! -f "$KEY_PATH" ]]; then
-  echo "Erzeuge neuen SSH Deploy Key..."
-  ssh-keygen -t ed25519 -C "snom-config-deploy@$(hostname)" -f "$KEY_PATH" -N ""
-fi
-
-if ! ssh-keygen -F github.com -f "$KNOWN_HOSTS" >/dev/null 2>&1; then
-  ssh-keyscan -t ed25519 github.com >> "$KNOWN_HOSTS"
-fi
-
-chmod 0600 "$KEY_PATH"
-chmod 0644 "$KEY_PATH.pub" "$KNOWN_HOSTS"
-
-echo "Prüfe Zugriff auf Config-Repo..."
-SSH_CMD="ssh -i $KEY_PATH -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-while true; do
-  if GIT_SSH_COMMAND="$SSH_CMD" git ls-remote --heads "$REPO_SSH_URL" "$BRANCH" >/dev/null 2>&1; then
-    echo "Repo-Zugriff erfolgreich."
-    break
-  fi
-
-  echo "Repo-Zugriff fehlgeschlagen."
-  echo "Bitte Deploy Key in GitHub hinterlegen (Read-only) und SSH-Berechtigung prüfen."
-  echo "Public Key:"
-  cat "$KEY_PATH.pub"
-  echo
-  read -r -p "Erneut versuchen? [Enter]" _retry
+ssh-keyscan -H github.com > /etc/snom-config/known_hosts 2>/dev/null || die "GitHub Host-Key konnte nicht geladen werden (DNS/Netz prüfen)."
+chmod 0644 /etc/snom-config/known_hosts
+SSH_COMMAND="ssh -i $KEY_PATH -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/snom-config/known_hosts -o StrictHostKeyChecking=yes"
+until GIT_SSH_COMMAND="$SSH_COMMAND" git ls-remote --exit-code --heads "$REPO_SSH_URL" "$BRANCH" >/dev/null 2>&1; do
+  read -r -p "Repo noch nicht erreichbar. Deploy Key hinterlegt? Mit Enter erneut prüfen (q = Abbruch): " retry
+  [[ "$retry" != q ]] || die "Installation abgebrochen."
 done
 
-
-cat <<CFG > "$APP_DIR/ops/sync-config.env"
-REPO_SSH_URL="$REPO_SSH_URL"
-BRANCH="$BRANCH"
-TARGET_DIR="$TARGET_DIR"
-CFG
-chmod 0600 "$APP_DIR/ops/sync-config.env"
-
-cat <<RUNTIME > /etc/snom-config/runtime.env
-ADMIN_IP=$ADMIN_IP
+{
+  printf 'REPO_SSH_URL=%q\n' "$REPO_SSH_URL"
+  printf 'BRANCH=%q\n' "$BRANCH"
+  printf 'TARGET_DIR=%q\n' "$SITE_ROOT/private/config"
+  printf 'KEY_PATH=%q\n' "$KEY_PATH"
+  printf 'KNOWN_HOSTS=%q\n' /etc/snom-config/known_hosts
+  printf 'PHONE_SECRETS=%q\n' /etc/snom-config/phone.env
+} > /etc/snom-config/sync.env
+{
+  printf 'PHONE_HTTP_USER=%q\n' "$PHONE_HTTP_USER"
+  printf 'PHONE_HTTP_PASS=%q\n' "$PHONE_HTTP_PASS"
+} > /etc/snom-config/phone.env
+cat > /etc/snom-config/runtime.env <<EOF
+DATA_DIR=$SITE_ROOT/private/config
 MAINTENANCE_FILE=/etc/snom-config/maintenance.on
 AUDIT_LOG_PATH=/var/log/snom-config/audit.log
-RUNTIME
+EOF
+chmod 0600 /etc/snom-config/{sync,phone}.env
 chmod 0640 /etc/snom-config/runtime.env
 
-cp "$SERVICE_SRC" "$SERVICE_DST"
-cp "$TIMER_SRC" "$TIMER_DST"
+# FTPS (explizites TLS auf Port 21); SFTP wird in einen eigenen, beschränkten Chroot gesetzt.
+cat > /etc/vsftpd.conf <<EOF
+listen=YES
+listen_ipv6=NO
+anonymous_enable=NO
+local_enable=YES
+write_enable=YES
+chroot_local_user=YES
+allow_writeable_chroot=NO
+local_root=$SITE_ROOT
+local_umask=027
+ssl_enable=YES
+force_local_logins_ssl=YES
+force_local_data_ssl=YES
+rsa_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
+rsa_private_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+ssl_tlsv1=YES
+ssl_sslv2=NO
+ssl_sslv3=NO
+pasv_min_port=40000
+pasv_max_port=40100
+EOF
+cat > /etc/ssh/sshd_config.d/60-snom-sftp.conf <<EOF
+Match User $TRANSFER_USER
+    ChrootDirectory $SITE_ROOT
+    ForceCommand internal-sftp
+    PasswordAuthentication yes
+    AllowTcpForwarding no
+    X11Forwarding no
+    PermitTunnel no
+EOF
 
-sed -i "s|OnUnitActiveSec=15min|OnUnitActiveSec=${SYNC_INTERVAL_MIN}min|" "$TIMER_DST"
-
-cat > /etc/nginx/sites-available/snom-config <<NGINX
+PHP_SOCKET="$(find /run/php -maxdepth 1 -type s -name 'php*-fpm.sock' | sort -V | tail -1)"
+[[ -n "$PHP_SOCKET" ]] || die "Kein PHP-FPM Socket gefunden."
+cat > /etc/nginx/sites-available/snom-config <<EOF
 server {
-    listen ${BIND_ADDR}:8080 default_server;
-    listen [::]:8080 default_server;
+    listen $BIND_ADDR:8080 default_server;
     server_name _;
-
-    root $APP_DIR/public;
+    root $SITE_ROOT/www;
     index index.php;
-
     auth_basic "Snom Config";
     auth_basic_user_file /etc/nginx/.htpasswd-snom;
-
     server_tokens off;
-    client_max_body_size 1m;
     add_header X-Content-Type-Options nosniff always;
-    add_header X-Frame-Options DENY always;
     add_header Referrer-Policy no-referrer always;
-    add_header Cache-Control "no-store" always;
-
-    if ($request_method !~ ^(GET|HEAD)$) { return 405; }
-
-    
-    # __PROXY_ALLOWLIST__
+    if (\$request_method !~ ^(GET|HEAD)\$) { return 405; }
     location / { try_files \$uri \$uri/ =404; }
-    location ^~ /data/ { deny all; return 403; }
-
-    location ~ \.php$ {
+    location ~ \.php\$ {
         include snippets/fastcgi-php.conf;
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_pass unix:$PHP_SOCKET;
     }
-
-    location ~ /\.|/\.git { deny all; }
+    location ~ /\. { deny all; }
 }
-NGINX
-ln -sf /etc/nginx/sites-available/snom-config /etc/nginx/sites-enabled/snom-config
+EOF
+htpasswd -cb /etc/nginx/.htpasswd-snom "$BASIC_USER" "$BASIC_PASS" >/dev/null
+ln -sfn /etc/nginx/sites-available/snom-config /etc/nginx/sites-enabled/snom-config
 rm -f /etc/nginx/sites-enabled/default
 
-if [[ -n "$TRUSTED_PROXY_CIDR" ]]; then
-  sed -i "s|# __PROXY_ALLOWLIST__|allow $TRUSTED_PROXY_CIDR;\n    deny all;|" /etc/nginx/sites-available/snom-config
-else
-  sed -i "s|# __PROXY_ALLOWLIST__|# kein Proxy-Filter gesetzt|" /etc/nginx/sites-available/snom-config
-fi
-
-htpasswd -cb /etc/nginx/.htpasswd-snom "$BASIC_USER" "$BASIC_PASS"
-
+sed -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@SITE_ROOT@|$SITE_ROOT|g" "$APP_DIR/ops/snom-config-sync.service" > /etc/systemd/system/snom-config-sync.service
+sed "s|OnUnitActiveSec=15min|OnUnitActiveSec=${SYNC_INTERVAL_MIN}min|" "$APP_DIR/ops/snom-config-sync.timer" > /etc/systemd/system/snom-config-sync.timer
+sshd -t
 systemctl daemon-reload
+systemctl enable --now ssh vsftpd
 systemctl enable --now snom-config-sync.timer
+systemctl start snom-config-sync.service
 nginx -t
+systemctl enable --now nginx
 systemctl reload nginx
 
-
-apply_phone_http_credentials() {
-  local xml_file="$TARGET_DIR/global-settings/default.xml"
-  if [[ ! -f "$xml_file" ]]; then
-    return 0
-  fi
-
-  PHONE_HTTP_USER="$PHONE_HTTP_USER" PHONE_HTTP_PASS="$PHONE_HTTP_PASS" XML_FILE="$xml_file" python3 - <<'PYXML'
-import os
-import re
-from pathlib import Path
-
-xml_file = Path(os.environ["XML_FILE"])
-phone_user = os.environ["PHONE_HTTP_USER"]
-phone_pass = os.environ["PHONE_HTTP_PASS"]
-text = xml_file.read_text(encoding="utf-8")
-text = re.sub(r"<http_user[^>]*>[^<]*</http_user>", f'<http_user perm="R">{phone_user}</http_user>', text)
-text = re.sub(r"<http_pass[^>]*>[^<]*</http_pass>", f'<http_pass perm="R">{phone_pass}</http_pass>', text)
-xml_file.write_text(text, encoding="utf-8")
-PYXML
-}
-
-"$APP_DIR/ops/sync-config.sh" || true
-apply_phone_http_credentials
-
-echo ""
-echo "=== FERTIG ==="
-echo "1) Hinterlege diesen Public Key als Deploy Key (Read only) in GitHub:"
-cat "$KEY_PATH.pub"
-echo ""
-echo "2) Teste den Sync danach manuell:"
-echo "   systemctl start snom-config-sync.service"
-echo ""
-echo "3) Timer-Status:"
-echo "   systemctl status snom-config-sync.timer"
-echo ""
-echo "4) Audit-Log: /var/log/snom-config/audit.log"
-echo "5) Panikschalter aktivieren: touch /etc/snom-config/maintenance.on"
-echo "   Panikschalter deaktivieren: rm /etc/snom-config/maintenance.on"
-echo ""
-echo "6) In den Snom-Telefonen als Provisioning URL eintragen:"
-echo "   http://<URL-LOGIN-USER>:<URL-LOGIN-PASS>@<DEIN-SERVER-ODER-PROXY>:8080/global-settings.php?file=default"
-echo "   http://<URL-LOGIN-USER>:<URL-LOGIN-PASS>@<DEIN-SERVER-ODER-PROXY>:8080/fkey.php?file=default"
+echo; echo "=== Installation abgeschlossen ==="
+echo "Webroot der Domain: $SITE_ROOT/www (Nginx lokal auf Port 8080)"
+echo "Sensible Config:     $SITE_ROOT/private/config (nicht unter dem Webroot)"
+echo "FTPS: Port 21 (+ passive Ports 40000-40100), SFTP: Port 22, Benutzer: $TRANSFER_USER"
+echo "Provisioning: http://SERVER:8080/global-settings.php?file=default"

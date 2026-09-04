@@ -5,7 +5,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/bootstrap.php';
 snomMaintenanceGuard('global-settings');
 
-$baseDir = dirname(__DIR__) . '/data/config/global-settings/';
+$baseDir = rtrim(snomEnv('DATA_DIR', dirname(__DIR__) . '/data/config'), '/') . '/global-settings/';
 $rawFile = isset($_GET['file']) ? (string) $_GET['file'] : 'default';
 $file = basename(trim($rawFile));
 

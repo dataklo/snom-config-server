@@ -7,8 +7,8 @@ Wants=network-online.target
 Type=oneshot
 User=root
 Group=root
-WorkingDirectory=/opt/snom-config-server
-ExecStart=/opt/snom-config-server/ops/sync-config.sh
+WorkingDirectory=@APP_DIR@
+ExecStart=@APP_DIR@/ops/sync-config.sh
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
@@ -19,7 +19,7 @@ ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 MemoryDenyWriteExecute=yes
 LockPersonality=yes
-ReadWritePaths=/opt/snom-config-server/data/config /var/lib/snom-config-server /var/lock
+ReadWritePaths=@SITE_ROOT@/private/config /var/lib/snom-config-server /var/lock /tmp
 
 [Install]
 WantedBy=multi-user.target
