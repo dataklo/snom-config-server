@@ -18,12 +18,13 @@ valid_path() { [[ "$1" = /* && "$1" != "/" && "$1" != *$'\n'* ]] || die "Ungült
 
 echo "=== Snom Config Server – Ubuntu/Proxmox-CT Installer ==="
 prompt APP_DIR "Pfad für Programmdateien (nicht im Webroot)" "$APP_DIR"
-prompt SITE_ROOT "FTP/SFTP-Root (die Domain muss auf SITE_ROOT/www zeigen)" "$SITE_ROOT"
+prompt SITE_ROOT "FTP/SFTP-Root (Uploads; nicht als Webroot verwenden)" "$SITE_ROOT"
 prompt TRANSFER_USER "Benutzer für FTPS und SFTP" "$TRANSFER_USER"
 secret TRANSFER_PASS "Passwort für FTPS/SFTP-Benutzer"
 prompt REPO_SSH_URL "Privates Config-Repo (SSH URL)" "$REPO_SSH_URL"
 prompt BRANCH "Git Branch" "$BRANCH"
 prompt SYNC_INTERVAL_MIN "Sync-Intervall in Minuten" "$SYNC_INTERVAL_MIN"
+prompt FTP_PUBLIC_HOST "Öffentliche IP oder DNS-Name für FTPS (Passive Mode)" "$(hostname -f 2>/dev/null || hostname)"
 prompt BIND_ADDR "Nginx Bind-Adresse" "0.0.0.0"
 prompt BASIC_USER "URL-Login Benutzername" "admin"
 secret BASIC_PASS "URL-Login Passwort"
@@ -33,21 +34,24 @@ secret PHONE_HTTP_PASS "Telefon-HTTP Passwort für die XML"
 valid_path "$APP_DIR"; valid_path "$SITE_ROOT"
 [[ "$SYNC_INTERVAL_MIN" =~ ^[1-9][0-9]*$ ]] || die "Das Sync-Intervall muss eine positive Ganzzahl sein."
 [[ "$TRANSFER_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Ungültiger Benutzername."
+[[ "$FTP_PUBLIC_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "Ungültige öffentliche FTPS-Adresse."
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y nginx php-fpm php-cli php-xml apache2-utils git rsync openssh-client openssh-server vsftpd ssl-cert python3 util-linux
 
-# Der Chroot selbst muss root gehören. Nur www ist für den Transfer-Benutzer schreibbar.
+# Der Chroot selbst muss root gehören. Nur uploads ist für den Transfer-Benutzer
+# schreibbar; ausführbarer Anwendungscode bleibt außerhalb dieses Baums.
 install -d -o root -g root -m 0755 "$SITE_ROOT"
 install -d -o root -g www-data -m 0750 "$SITE_ROOT/private" "$SITE_ROOT/private/config"
 if ! id "$TRANSFER_USER" >/dev/null 2>&1; then
   useradd --home-dir / --shell /usr/sbin/nologin --no-create-home "$TRANSFER_USER"
 fi
 printf '%s:%s\n' "$TRANSFER_USER" "$TRANSFER_PASS" | chpasswd
-install -d -o "$TRANSFER_USER" -g "$TRANSFER_USER" -m 0750 "$SITE_ROOT/www"
+install -d -o "$TRANSFER_USER" -g "$TRANSFER_USER" -m 0750 "$SITE_ROOT/uploads"
 
-# Installationsquellen kopieren; Repo-Geheimnisse und Config bleiben außerhalb von www.
+# Installationsquellen kopieren; Repo-Geheimnisse und Config bleiben außerhalb
+# des root-eigenen öffentlichen Anwendungsverzeichnisses.
 if [[ "$SOURCE_DIR" != "$APP_DIR" ]]; then
   install -d -m 0755 "$APP_DIR"
   rsync -a --delete --exclude data --exclude ops/sync-config.env "$SOURCE_DIR/public/" "$APP_DIR/public/"
@@ -55,12 +59,16 @@ if [[ "$SOURCE_DIR" != "$APP_DIR" ]]; then
 else
   install -d -m 0755 "$APP_DIR/public" "$APP_DIR/ops"
 fi
-rsync -a --delete "$APP_DIR/public/" "$SITE_ROOT/www/"
-chown -R "$TRANSFER_USER:$TRANSFER_USER" "$SITE_ROOT/www"
-find "$SITE_ROOT/www" -type d -exec chmod 0755 {} +
-find "$SITE_ROOT/www" -type f -exec chmod 0644 {} +
+# PHP wird direkt aus dem root-eigenen APP_DIR ausgeliefert. Transfer-Zugangsdaten
+# können daher niemals zum Ersetzen oder Hochladen ausführbarer Endpunkte dienen.
+chown -R root:root "$APP_DIR/public"
+find "$APP_DIR/public" -type d -exec chmod 0755 {} +
+find "$APP_DIR/public" -type f -exec chmod 0644 {} +
 
-install -d -m 0750 /etc/snom-config /var/lib/snom-config-server /var/log/snom-config
+# www-data darf nur runtime.env lesen und das Verzeichnis dafür durchqueren. Die
+# Deploy- und Telefon-Secrets bleiben root:root und 0600.
+install -d -o root -g www-data -m 0710 /etc/snom-config
+install -d -m 0750 /var/lib/snom-config-server /var/log/snom-config
 KEY_PATH=/etc/snom-config/config_repo_ed25519
 if [[ ! -f "$KEY_PATH" ]]; then ssh-keygen -q -t ed25519 -C "snom-config-deploy@$(hostname)" -f "$KEY_PATH" -N ''; fi
 chmod 0600 "$KEY_PATH"; chmod 0644 "$KEY_PATH.pub"
@@ -101,6 +109,7 @@ MAINTENANCE_FILE=/etc/snom-config/maintenance.on
 AUDIT_LOG_PATH=/var/log/snom-config/audit.log
 EOF
 chmod 0600 /etc/snom-config/{sync,phone}.env
+chown root:www-data /etc/snom-config/runtime.env
 chmod 0640 /etc/snom-config/runtime.env
 
 # FTPS (explizites TLS auf Port 21); SFTP wird in einen eigenen, beschränkten Chroot gesetzt.
@@ -124,6 +133,8 @@ ssl_sslv2=NO
 ssl_sslv3=NO
 pasv_min_port=40000
 pasv_max_port=40100
+pasv_address=$FTP_PUBLIC_HOST
+pasv_addr_resolve=YES
 EOF
 cat > /etc/ssh/sshd_config.d/60-snom-sftp.conf <<EOF
 Match User $TRANSFER_USER
@@ -141,7 +152,7 @@ cat > /etc/nginx/sites-available/snom-config <<EOF
 server {
     listen $BIND_ADDR:8080 default_server;
     server_name _;
-    root $SITE_ROOT/www;
+    root $APP_DIR/public;
     index index.php;
     auth_basic "Snom Config";
     auth_basic_user_file /etc/nginx/.htpasswd-snom;
@@ -164,6 +175,7 @@ rm -f /etc/nginx/sites-enabled/default
 
 sed -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@SITE_ROOT@|$SITE_ROOT|g" "$APP_DIR/ops/snom-config-sync.service" > /etc/systemd/system/snom-config-sync.service
 sed "s|OnUnitActiveSec=15min|OnUnitActiveSec=${SYNC_INTERVAL_MIN}min|" "$APP_DIR/ops/snom-config-sync.timer" > /etc/systemd/system/snom-config-sync.timer
+ln -sfn "$APP_DIR/ops/edit-config.sh" /usr/local/sbin/snom-config-edit
 sshd -t
 systemctl daemon-reload
 systemctl enable --now ssh vsftpd
@@ -174,7 +186,10 @@ systemctl enable --now nginx
 systemctl reload nginx
 
 echo; echo "=== Installation abgeschlossen ==="
-echo "Webroot der Domain: $SITE_ROOT/www (Nginx lokal auf Port 8080)"
+echo "Webroot der Domain: $APP_DIR/public (Nginx lokal auf Port 8080, root-owned)"
+echo "Transfer-Uploads:    $SITE_ROOT/uploads (nicht durch Nginx/PHP ausgeführt)"
 echo "Sensible Config:     $SITE_ROOT/private/config (nicht unter dem Webroot)"
 echo "FTPS: Port 21 (+ passive Ports 40000-40100), SFTP: Port 22, Benutzer: $TRANSFER_USER"
+echo "FTPS extern:         $FTP_PUBLIC_HOST"
+echo "Config bearbeiten:   sudo snom-config-edit [relative/datei.xml]"
 echo "Provisioning: http://SERVER:8080/global-settings.php?file=default"
